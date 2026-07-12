@@ -264,7 +264,12 @@ def main():
                 f"(not a real reel): {item.get('errorDescription', item.get('error'))}"
             )
             continue
-
+# The actor's own "skip pinned reels" input isn't reliable - it can
+        # still return an account's pinned reels regardless of that setting
+        # or the date filter. Filter them out here instead.
+        if item.get("isPinned"):
+            log(f"Skipping pinned reel (not a new post): {item.get('url')}")
+            continue
         rid = reel_id(item)
         if rid in processed:
             continue
