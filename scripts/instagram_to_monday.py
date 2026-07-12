@@ -49,7 +49,7 @@ LINK_COLUMN_ID = "link_mkkw6x1d"
 
 # Only scrape reels newer than this (keep in sync with how often the Action runs).
 # "2 days" gives a safety margin if a run is ever delayed or skipped.
-ONLY_NEWER_THAN = "2 days"
+ONLY_NEWER_THAN = "30 days"
 RESULTS_LIMIT = 10
 
 # Model used to compare a reel's caption against existing calendar item names.
