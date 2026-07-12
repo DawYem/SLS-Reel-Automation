@@ -27,6 +27,7 @@ jobs:
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           MONDAY_TOKEN: ${{ secrets.MONDAY_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python scripts/instagram_to_monday.py
 
       - name: Commit updated state file
