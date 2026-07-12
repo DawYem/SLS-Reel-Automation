@@ -8,11 +8,14 @@ What this does, every time it runs:
      endpoint, which runs the Actor and hands back the results in one call).
   2. Skips any reel we've already filed (tracked in state/processed_reels.json).
   3. For each new reel:
-       - Checks the caption/hashtags for "day of service" / "community service".
-       - Looks for a matching item on the monday.com board by name.
-       - If found, drops the reel link into that item's Link column.
-       - If not found, creates a new item in the current month's group and
-         sets the Link column there.
+       - Pulls every existing item name from the monday.com board.
+       - Asks Claude to compare the reel's caption/content against those
+         item names and decide - confidently - whether this reel belongs
+         with an existing item (same event/campaign/topic), or is something new.
+       - If a confident match is found, drops the reel link into that item's
+         Link column.
+       - If not, creates a new item in the current month's group and sets
+         the Link column there.
   4. Saves the updated "already processed" list back to disk.
 
 This script is meant to be run on a schedule by GitHub Actions (see
@@ -20,8 +23,10 @@ This script is meant to be run on a schedule by GitHub Actions (see
 state file back to the repo so the next run knows what's already been done.
 
 Required environment variables (set as GitHub Actions secrets):
-  APIFY_TOKEN   - Apify personal API token
-  MONDAY_TOKEN  - monday.com personal API token
+  APIFY_TOKEN       - Apify personal API token
+  MONDAY_TOKEN      - monday.com personal API token
+  ANTHROPIC_API_KEY - Anthropic API key, used to intelligently match a reel's
+                      content against existing calendar item names
 """
 
 import json
@@ -47,9 +52,10 @@ LINK_COLUMN_ID = "link_mkkw6x1d"
 ONLY_NEWER_THAN = "2 days"
 RESULTS_LIMIT = 10
 
-# Caption/hashtag keywords that mean "this reel belongs with our recurring
-# Day of Service content" - matched case-insensitively as substrings.
-MATCH_KEYWORDS = ["day of service", "community service"]
+# Model used to compare a reel's caption against existing calendar item names.
+# Haiku is plenty for this simple matching task and keeps cost negligible.
+ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Month name -> monday.com group ID, from the board's existing group structure.
 MONTH_GROUPS = {
@@ -71,6 +77,7 @@ STATE_FILE = Path(__file__).resolve().parent.parent / "state" / "processed_reels
 
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN")
 MONDAY_TOKEN = os.environ.get("MONDAY_TOKEN")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
 MONDAY_API_URL = "https://api.monday.com/v2"
 
@@ -141,9 +148,73 @@ def reel_caption(item):
     return ""
 
 
-def matches_keywords(caption):
-    caption_lower = (caption or "").lower()
-    return any(kw in caption_lower for kw in MATCH_KEYWORDS)
+def ai_match_item(caption, board_items):
+    """
+    Ask Claude whether this reel's caption clearly corresponds to an existing
+    monday.com calendar item (same event, campaign, or topic), by comparing
+    the reel's content against every item name on the board. Returns the
+    matching item dict, or None if there's no confident match.
+    """
+    if not ANTHROPIC_API_KEY:
+        sys.exit("Missing ANTHROPIC_API_KEY environment variable.")
+    if not board_items:
+        return None
+
+    item_list = "\n".join(f"- {item['name']}" for item in board_items)
+    prompt = f"""You're matching a new Instagram reel to an existing marketing content calendar for a nonprofit.
+
+Reel caption:
+\"\"\"
+{caption or "(no caption)"}
+\"\"\"
+
+Existing calendar item names:
+{item_list}
+
+Does this reel clearly correspond to one of these existing items (the same event, campaign, or topic - not just a vague thematic similarity)? Only answer yes if you're confident. A generic or unrelated reel should not be forced into a match - it's completely fine, and expected, to say there's no match.
+
+Reply with ONLY a JSON object and nothing else, in exactly this shape:
+{{"match": "<exact item name from the list above>", "confident": true}}
+or
+{{"match": null, "confident": false}}"""
+
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    body = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 200,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    resp = requests.post(ANTHROPIC_API_URL, headers=headers, json=body, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    text = "".join(
+        block.get("text", "")
+        for block in data.get("content", [])
+        if block.get("type") == "text"
+    ).strip()
+    # Be forgiving of stray code fences, just in case.
+    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
+
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        log(f"Could not parse Claude's matching response as JSON, treating as no match: {text!r}")
+        return None
+
+    if not result.get("confident") or not result.get("match"):
+        return None
+
+    match_name = result["match"]
+    for item in board_items:
+        if item["name"] == match_name:
+            return item
+
+    log(f"Claude returned a match name not found on the board, treating as no match: {match_name!r}")
+    return None
 
 
 def monday_request(query, variables=None):
@@ -166,8 +237,8 @@ def monday_request(query, variables=None):
     return data["data"]
 
 
-def find_matching_item():
-    """Look for an existing board item whose name mentions our keywords."""
+def get_all_board_items():
+    """Fetch every item currently on the board (id + name) for AI matching."""
     query = """
     query ($boardId: [ID!]) {
       boards(ids: $boardId) {
@@ -181,12 +252,7 @@ def find_matching_item():
     }
     """
     data = monday_request(query, {"boardId": [BOARD_ID]})
-    items = data["boards"][0]["items_page"]["items"]
-    for item in items:
-        name_lower = item["name"].lower()
-        if any(kw in name_lower for kw in MATCH_KEYWORDS):
-            return item
-    return None
+    return data["boards"][0]["items_page"]["items"]
 
 
 def set_link_column(item_id, url):
@@ -255,6 +321,7 @@ def default_item_name(caption):
 def main():
     processed = load_processed_ids()
     reels = fetch_new_reels()
+    board_items = get_all_board_items()
 
     new_count = 0
     for item in reels:
@@ -264,12 +331,14 @@ def main():
                 f"(not a real reel): {item.get('errorDescription', item.get('error'))}"
             )
             continue
-# The actor's own "skip pinned reels" input isn't reliable - it can
+
+        # The actor's own "skip pinned reels" input isn't reliable - it can
         # still return an account's pinned reels regardless of that setting
         # or the date filter. Filter them out here instead.
         if item.get("isPinned"):
             log(f"Skipping pinned reel (not a new post): {item.get('url')}")
             continue
+
         rid = reel_id(item)
         if rid in processed:
             continue
@@ -284,19 +353,19 @@ def main():
         log(f"New reel: {url}")
         log(f"Caption/hashtags: {caption[:120]!r}")
 
-        if matches_keywords(caption):
-            matched_item = find_matching_item()
-        else:
-            matched_item = None
+        matched_item = ai_match_item(caption, board_items)
 
         if matched_item:
-            log(f"Matched existing item '{matched_item['name']}' (id={matched_item['id']}) - adding link.")
+            log(f"Claude matched this to existing item '{matched_item['name']}' (id={matched_item['id']}) - adding link.")
             set_link_column(matched_item["id"], url)
         else:
             name = default_item_name(caption)
-            log(f"No match found - creating new item '{name}'.")
+            log(f"No confident match found - creating new item '{name}'.")
             new_id = create_item_with_link(name, url)
             log(f"Created item id={new_id}.")
+            # So a second new reel in this same run could still match this
+            # brand-new item if it turns out to be about the same thing.
+            board_items.append({"id": new_id, "name": name})
 
         processed.add(rid)
         new_count += 1
