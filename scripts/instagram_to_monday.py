@@ -258,6 +258,13 @@ def main():
 
     new_count = 0
     for item in reels:
+        if item.get("error"):
+            log(
+                "Actor returned an error/placeholder item, skipping "
+                f"(not a real reel): {item.get('errorDescription', item.get('error'))}"
+            )
+            continue
+
         rid = reel_id(item)
         if rid in processed:
             continue
